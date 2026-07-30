@@ -12,6 +12,7 @@ widget is ever touched off the main thread.
 from __future__ import annotations
 
 import queue
+import signal
 import threading
 import time
 import tkinter as tk
@@ -32,6 +33,7 @@ TEXT = "#e7eef5"
 MUTED = "#8aa0b4"
 GOOD = "#5fd08a"
 WARN = "#e0a24a"
+DANGER = "#d05f6a"      # exit button
 
 
 class NetMonApp:
@@ -51,6 +53,7 @@ class NetMonApp:
         except tk.TclError:
             pass
         root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
+        root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
         self._init_fonts()
 
@@ -111,6 +114,11 @@ class NetMonApp:
 
         self.rescan_btn = self._touch_button(header, "Rescan", self.trigger_scan)
         self.rescan_btn.pack(side="right")
+
+        self.exit_btn = self._touch_button(
+            header, "Exit", self.shutdown, bg=DANGER, fg="#2a0b0f"
+        )
+        self.exit_btn.pack(side="right", padx=(0, 10))
 
         self.status_lbl = tk.Label(
             self.list_view, text="Starting up ...", font=self.f_status,
@@ -318,6 +326,16 @@ class NetMonApp:
             self.root.after_cancel(self._auto_after_id)
             self._auto_after_id = None
 
+    def shutdown(self, *_):
+        """Tear down the Tk root cleanly. Safe to call from a signal handler
+        (via root.after) or from the WM close button. Scanner threads are
+        daemons and exit with the process."""
+        self._cancel_auto_refresh()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
     # ---- queue pump (runs on main thread) ------------------------------------
     def _poll_queue(self):
         try:
@@ -343,13 +361,31 @@ class NetMonApp:
                         self._render_detail()
         except queue.Empty:
             pass
-        self.root.after(150, self._poll_queue)
+        try:
+            self.root.after(150, self._poll_queue)
+        except tk.TclError:
+            pass  # root already destroyed
 
 
 def main():
     root = tk.Tk()
-    NetMonApp(root)
-    root.mainloop()
+    app = NetMonApp(root)
+
+    # Ctrl-C / SIGTERM -> clean exit. Signal handlers only fire between
+    # Python bytecode ops, and Tk's mainloop blocks in C, so we bounce the
+    # shutdown back onto the Tk main thread via root.after(0, ...). The
+    # existing 150ms _poll_queue tick keeps the interpreter warm enough to
+    # notice the signal within a fraction of a second.
+    def _on_signal(_sig, _frame):
+        root.after(0, app.shutdown)
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        app.shutdown()
 
 
 if __name__ == "__main__":
