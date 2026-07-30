@@ -246,6 +246,78 @@ def ping_sweep(subnet_cidr: str, workers: int = 96) -> list[str]:
     return alive
 
 
+# ----------------------------------------------------------------------------
+# OUI vendor lookup — filled once from /usr/share/ieee-data/oui.txt (arp-scan
+# pulls that package in as a dep) or nmap's smaller mac-prefixes list. Cached
+# in-process for the lifetime of the app.
+# ----------------------------------------------------------------------------
+_OUI_CACHE: dict[str, str] = {}
+_OUI_LOADED = False
+_OUI_PATHS = [
+    "/usr/share/ieee-data/oui.txt",
+    "/var/lib/ieee-data/oui.txt",
+    "/usr/share/nmap/nmap-mac-prefixes",
+    "/usr/share/arp-scan/ieee-oui.txt",
+]
+
+
+def _load_oui() -> None:
+    global _OUI_LOADED
+    if _OUI_LOADED:
+        return
+    _OUI_LOADED = True
+    for path in _OUI_PATHS:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # ieee-data format: "E8-9C-25   (hex)\t\tAzureWave ..."
+                    if "(hex)" in line:
+                        parts = line.split("(hex)")
+                        prefix = parts[0].strip().replace("-", ":").lower()
+                        vendor = parts[1].strip()
+                        if len(prefix) == 8 and vendor:
+                            _OUI_CACHE.setdefault(prefix, vendor)
+                        continue
+                    # nmap / arp-scan format: "E89C25 AzureWave ..."
+                    m = re.match(r"^([0-9A-Fa-f]{6})[\s\t]+(.+)$", line)
+                    if m:
+                        raw = m.group(1)
+                        prefix = f"{raw[0:2]}:{raw[2:4]}:{raw[4:6]}".lower()
+                        _OUI_CACHE.setdefault(prefix, m.group(2).strip())
+            if _OUI_CACHE:
+                return
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+
+def _is_locally_administered(mac: str) -> bool:
+    """The U/L bit (bit 1 of the first octet) is set on locally-administered
+    (typically randomized) MACs — Apple/Google 'private wifi address' etc."""
+    if len(mac) < 2:
+        return False
+    try:
+        return bool(int(mac[:2], 16) & 0x02)
+    except ValueError:
+        return False
+
+
+def lookup_vendor(mac: str) -> str:
+    """Return a vendor string for `mac`, or '' if unknown. Locally-administered
+    MACs are labeled explicitly so the UI can explain phones with private wifi
+    addresses instead of leaving the vendor field blank."""
+    if not mac or len(mac) < 8:
+        return ""
+    if _is_locally_administered(mac):
+        return "randomized MAC"
+    _load_oui()
+    return _OUI_CACHE.get(mac[:8].lower(), "")
+
+
 def read_arp_cache() -> dict[str, str]:
     table: dict[str, str] = {}
     try:
@@ -469,6 +541,21 @@ class NetworkScanner:
 
         # Add the Vivid Unit itself — arp-scan/ping never see the host.
         self._add_self(merged)
+
+        # Backfill any missing MACs from the kernel ARP cache. The ping-sweep
+        # supplement forces the kernel to ARP for every alive IP, so most
+        # MAC-less devices at this point will have an entry here.
+        arp = read_arp_cache()
+        for d in merged.values():
+            if not d.mac and d.ip in arp:
+                d.mac = arp[d.ip]
+
+        # Backfill vendors from the OUI database for anything still missing.
+        for d in merged.values():
+            if d.mac and not d.vendor:
+                v = lookup_vendor(d.mac)
+                if v:
+                    d.vendor = v
 
         devices = list(merged.values())
         self.last_method = " / ".join(methods)

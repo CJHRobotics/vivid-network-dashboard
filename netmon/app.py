@@ -36,6 +36,9 @@ WARN = "#e0a24a"
 DANGER = "#d05f6a"      # exit button
 
 
+TAP_SLOP_PX = 10  # finger movement above this becomes a scroll, not a tap
+
+
 class NetMonApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -44,6 +47,12 @@ class NetMonApp:
         self.msg_q: queue.Queue = queue.Queue()
         self.scanning = False
         self._auto_after_id = None
+        # Shared tap-vs-swipe state for the row list. A press records the
+        # starting y; motion beyond TAP_SLOP_PX flips this to a scroll, and
+        # the row's ButtonRelease handler consults it to decide whether to
+        # open the detail view.
+        self._touch_start_y = 0
+        self._touch_scrolling = False
 
         root.title("Network Monitor")
         root.configure(bg=BG)
@@ -93,14 +102,25 @@ class NetMonApp:
         if width:
             btn.configure(width=width)
 
-        def on_press(_):
+        state = {"press_y": 0, "moved": False}
+
+        def on_press(event):
             btn.configure(bg=CARD_HI)
+            state["press_y"] = event.y_root
+            state["moved"] = False
+
+        def on_motion(event):
+            if not state["moved"] and abs(event.y_root - state["press_y"]) > TAP_SLOP_PX:
+                state["moved"] = True
+                btn.configure(bg=bg)  # cancel pressed-look
 
         def on_release(_):
             btn.configure(bg=bg)
-            command()
+            if not state["moved"]:
+                command()
 
         btn.bind("<ButtonPress-1>", on_press)
+        btn.bind("<B1-Motion>", on_motion)
         btn.bind("<ButtonRelease-1>", on_release)
         return btn
 
@@ -147,20 +167,28 @@ class NetMonApp:
             lambda e: self.canvas.itemconfigure(self._rows_window, width=e.width),
         )
 
-        # Touch drag-to-scroll (capacitive touch arrives as button-1 events)
-        self._drag_y = 0
-        self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
-        self.canvas.bind("<B1-Motion>", self._on_drag_move)
+        # Touch drag-to-scroll. Rows install the same handlers on themselves
+        # (see _render_row) so a swipe starting on a device row also scrolls
+        # instead of firing a tap.
+        self.canvas.bind("<ButtonPress-1>", self._touch_press)
+        self.canvas.bind("<B1-Motion>", self._touch_motion)
         # Mouse wheel for desktop testing
         self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-2, "units"))
         self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(2, "units"))
 
-    def _on_drag_start(self, event):
-        self._drag_y = event.y
-        self.canvas.scan_mark(event.x, event.y)
+    def _touch_press(self, event):
+        self._touch_start_y = event.y_root
+        self._touch_scrolling = False
+        # scan_mark records a starting position — canvas.scan_dragto later
+        # scrolls by the (current - mark) delta. Screen-y is fine because
+        # we only ever compare deltas, and it's consistent across widgets.
+        self.canvas.scan_mark(0, event.y_root)
 
-    def _on_drag_move(self, event):
-        self.canvas.scan_dragto(event.x, event.y, gain=1)
+    def _touch_motion(self, event):
+        if not self._touch_scrolling and abs(event.y_root - self._touch_start_y) > TAP_SLOP_PX:
+            self._touch_scrolling = True
+        if self._touch_scrolling:
+            self.canvas.scan_dragto(0, event.y_root, gain=1)
 
     def _render_rows(self):
         for w in self.rows_frame.winfo_children():
@@ -194,12 +222,17 @@ class NetMonApp:
         chev = tk.Label(row, text=">", font=self.f_big, bg=CARD, fg=ACCENT)
         chev.pack(side="right", padx=20)
 
-        # Tap anywhere on the row opens detail. Bind on all child widgets so a
-        # tap on a label counts too.
+        # Tap anywhere on the row opens detail, unless the finger travelled
+        # more than TAP_SLOP_PX between press and release (in which case the
+        # gesture was a scroll). Bindings go on all child widgets so a tap
+        # on a label counts too.
         def open_detail(_=None, d=dev):
-            self.show_detail(d)
+            if not self._touch_scrolling:
+                self.show_detail(d)
 
         for w in (row, left, chev, *left.winfo_children()):
+            w.bind("<ButtonPress-1>", self._touch_press)
+            w.bind("<B1-Motion>", self._touch_motion)
             w.bind("<ButtonRelease-1>", open_detail)
 
     # ---- DETAIL VIEW ---------------------------------------------------------
