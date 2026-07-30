@@ -19,10 +19,11 @@ Tap **Deep Probe** to add:
 
 ## Install
 
-Copy this folder onto the Vivid Unit, then:
+Clone (or copy) this repo onto the Vivid Unit, then from the repo root:
 
 ```bash
-cd netmon
+git clone https://github.com/CJHRobotics/vivid-network-dashboard.git
+cd vivid-network-dashboard
 bash install.sh
 ```
 
