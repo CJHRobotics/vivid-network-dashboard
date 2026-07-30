@@ -243,6 +243,7 @@ class NetMonApp:
         self._field(colL, "IP address", d.ip)
         self._field(colL, "MAC address", d.mac or "unknown")
         self._field(colL, "Vendor", d.vendor or "unknown")
+        self._field(colL, "Seen on interface", d.iface or "unknown")
         self._field(colR, "Hostname", d.hostname or "no reverse DNS")
         seen = time.strftime("%H:%M:%S", time.localtime(d.last_seen))
         self._field(colR, "Last seen", seen)

@@ -32,6 +32,7 @@ class Device:
     mac: str = ""
     vendor: str = ""
     hostname: str = ""
+    iface: str = ""     # interface(s) the device was seen on
     last_seen: float = field(default_factory=time.time)
 
     # Filled in on demand by deep_probe()
@@ -61,37 +62,32 @@ def _run(cmd, timeout=None) -> subprocess.CompletedProcess:
     )
 
 
-def get_primary_interface() -> Optional[str]:
-    try:
-        out = _run(["ip", "route", "show", "default"], timeout=5).stdout
-        m = re.search(r"default via \S+ dev (\S+)", out)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    # last resort: first non-loopback iface with an inet addr
+def get_active_interfaces() -> list[tuple[str, str]]:
+    """Return [(iface, cidr), ...] for every up non-loopback IPv4 interface.
+
+    We deliberately do NOT restrict to the default-route interface, so that a
+    device connected via both ethernet and wifi (potentially on different
+    subnets) scans both. Link-local (169.254/16) addresses are skipped.
+    """
+    seen: dict[tuple[str, str], None] = {}
     try:
         out = _run(["ip", "-o", "-f", "inet", "addr", "show"], timeout=5).stdout
         for line in out.splitlines():
             parts = line.split()
-            if len(parts) >= 2 and parts[1] != "lo":
-                return parts[1]
+            if len(parts) < 4:
+                continue
+            iface = parts[1]
+            cidr = parts[3]
+            if iface == "lo":
+                continue
+            if cidr.startswith("169.254."):
+                continue
+            if not re.match(r"\d+\.\d+\.\d+\.\d+/\d+$", cidr):
+                continue
+            seen[(iface, cidr)] = None
     except Exception:
         pass
-    return None
-
-
-def get_subnet(iface: str) -> Optional[str]:
-    try:
-        out = _run(
-            ["ip", "-o", "-f", "inet", "addr", "show", "dev", iface], timeout=5
-        ).stdout
-        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", out)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return None
+    return list(seen.keys())
 
 
 # ----------------------------------------------------------------------------
@@ -327,13 +323,21 @@ def deep_probe(device: Device) -> Device:
 # ----------------------------------------------------------------------------
 class NetworkScanner:
     def __init__(self):
-        self.iface = get_primary_interface()
-        self.subnet = get_subnet(self.iface) if self.iface else None
+        self.interfaces: list[tuple[str, str]] = []
         self.last_method = ""
+        self.refresh_context()
 
     def refresh_context(self):
-        self.iface = get_primary_interface()
-        self.subnet = get_subnet(self.iface) if self.iface else None
+        self.interfaces = get_active_interfaces()
+
+    # Kept as read-only summaries for the status bar in app.py.
+    @property
+    def iface(self) -> str:
+        return ", ".join(i for i, _ in self.interfaces) or ""
+
+    @property
+    def subnet(self) -> str:
+        return ", ".join(c for _, c in self.interfaces) or ""
 
     def discover(self, status_cb: Optional[Callable[[str], None]] = None) -> list[Device]:
         def note(msg):
@@ -341,21 +345,45 @@ class NetworkScanner:
                 status_cb(msg)
 
         self.refresh_context()
-        if not self.iface or not self.subnet:
+        if not self.interfaces:
             note("No active network interface found")
             return []
 
-        note(f"Scanning {self.subnet} on {self.iface} ...")
-        devices = discover_arpscan(self.iface)
-        if devices is not None:
-            self.last_method = "arp-scan"
-        else:
-            note("arp-scan unavailable - falling back to ping sweep")
-            devices = discover_fallback(self.subnet)
-            self.last_method = "ping-sweep"
+        # Scan each active interface (ethernet + wifi + anything else up).
+        # Devices found on more than one interface are merged by IP, and their
+        # `iface` field accumulates the comma-separated list of interfaces.
+        merged: dict[str, Device] = {}
+        methods: list[str] = []
+        for iface, cidr in self.interfaces:
+            note(f"Scanning {cidr} on {iface} ...")
+            devs = discover_arpscan(iface)
+            if devs is not None:
+                methods.append(f"{iface}:arp-scan")
+            else:
+                note(f"arp-scan unavailable on {iface} - ping-sweep fallback")
+                devs = discover_fallback(cidr)
+                methods.append(f"{iface}:ping-sweep")
 
+            for d in devs:
+                d.iface = iface
+                existing = merged.get(d.ip)
+                if existing is None:
+                    merged[d.ip] = d
+                    continue
+                # Merge: keep richer fields, accumulate interfaces.
+                if not existing.mac and d.mac:
+                    existing.mac = d.mac
+                if not existing.vendor and d.vendor:
+                    existing.vendor = d.vendor
+                seen_ifaces = existing.iface.split(",") if existing.iface else []
+                if iface not in seen_ifaces:
+                    seen_ifaces.append(iface)
+                existing.iface = ",".join(seen_ifaces)
+
+        devices = list(merged.values())
+        self.last_method = " / ".join(methods)
         note(f"Resolving hostnames for {len(devices)} device(s) ...")
         enrich_hostnames(devices)
         devices.sort(key=lambda d: d.ip_sortkey)
-        note(f"{len(devices)} device(s) found via {self.last_method}")
+        note(f"{len(devices)} device(s) found ({self.last_method})")
         return devices
