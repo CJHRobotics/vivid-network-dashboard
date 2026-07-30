@@ -62,6 +62,27 @@ def _run(cmd, timeout=None) -> subprocess.CompletedProcess:
     )
 
 
+def get_interface_ipmac(iface: str) -> tuple[Optional[str], Optional[str]]:
+    """Return (ipv4, mac) for `iface`, or (None, None) if not up."""
+    ip = None
+    mac = None
+    try:
+        out = _run(
+            ["ip", "-o", "-f", "inet", "addr", "show", "dev", iface], timeout=5
+        ).stdout
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/\d+", out)
+        if m:
+            ip = m.group(1)
+    except Exception:
+        pass
+    try:
+        with open(f"/sys/class/net/{iface}/address") as f:
+            mac = f.read().strip().lower()
+    except Exception:
+        pass
+    return ip, mac
+
+
 def get_active_interfaces() -> list[tuple[str, str]]:
     """Return [(iface, cidr), ...] for every up non-loopback IPv4 interface.
 
@@ -100,7 +121,11 @@ def discover_arpscan(iface: str) -> Optional[list[Device]]:
     """Return devices via arp-scan, or None if arp-scan can't be used
     (not installed, or no permission) so the caller can fall back."""
     try:
-        proc = _run(["arp-scan", "--localnet", "-I", iface], timeout=90)
+        # --retry=4 catches sleepy wifi clients that ignore the first probe;
+        # each extra retry costs ~2s per /24, worth it on a 5-minute rescan.
+        proc = _run(
+            ["arp-scan", "--localnet", "-I", iface, "--retry=4"], timeout=120
+        )
     except FileNotFoundError:
         return None
     except subprocess.TimeoutExpired:
@@ -358,27 +383,31 @@ class NetworkScanner:
             note(f"Scanning {cidr} on {iface} ...")
             devs = discover_arpscan(iface)
             if devs is not None:
-                methods.append(f"{iface}:arp-scan")
+                method = "arp-scan"
             else:
                 note(f"arp-scan unavailable on {iface} - ping-sweep fallback")
                 devs = discover_fallback(cidr)
-                methods.append(f"{iface}:ping-sweep")
+                method = "ping-sweep"
 
-            for d in devs:
-                d.iface = iface
-                existing = merged.get(d.ip)
-                if existing is None:
-                    merged[d.ip] = d
-                    continue
-                # Merge: keep richer fields, accumulate interfaces.
-                if not existing.mac and d.mac:
-                    existing.mac = d.mac
-                if not existing.vendor and d.vendor:
-                    existing.vendor = d.vendor
-                seen_ifaces = existing.iface.split(",") if existing.iface else []
-                if iface not in seen_ifaces:
-                    seen_ifaces.append(iface)
-                existing.iface = ",".join(seen_ifaces)
+            self._merge(merged, devs, iface)
+
+            # Supplement arp-scan with a targeted ping sweep for anything ARP
+            # missed (sleepy phones, power-saving wifi clients that don't
+            # answer broadcast ARP but do respond to a direct ICMP echo).
+            if method == "arp-scan":
+                note(f"Ping-sweep supplement on {iface} ...")
+                known = {ip for ip, d in merged.items() if iface in d.iface.split(",")}
+                extra_ips = [ip for ip in ping_sweep(cidr) if ip not in known]
+                if extra_ips:
+                    arp = read_arp_cache()
+                    extras = [Device(ip=ip, mac=arp.get(ip, "")) for ip in extra_ips]
+                    self._merge(merged, extras, iface)
+                    method = "arp-scan+ping"
+
+            methods.append(f"{iface}:{method}")
+
+        # Add the Vivid Unit itself — arp-scan/ping never see the host.
+        self._add_self(merged)
 
         devices = list(merged.values())
         self.last_method = " / ".join(methods)
@@ -387,3 +416,44 @@ class NetworkScanner:
         devices.sort(key=lambda d: d.ip_sortkey)
         note(f"{len(devices)} device(s) found ({self.last_method})")
         return devices
+
+    @staticmethod
+    def _merge(merged: dict[str, Device], devs: list[Device], iface: str) -> None:
+        for d in devs:
+            d.iface = iface
+            existing = merged.get(d.ip)
+            if existing is None:
+                merged[d.ip] = d
+                continue
+            if not existing.mac and d.mac:
+                existing.mac = d.mac
+            if not existing.vendor and d.vendor:
+                existing.vendor = d.vendor
+            seen_ifaces = existing.iface.split(",") if existing.iface else []
+            if iface not in seen_ifaces:
+                seen_ifaces.append(iface)
+            existing.iface = ",".join(seen_ifaces)
+
+    def _add_self(self, merged: dict[str, Device]) -> None:
+        host = socket.gethostname()
+        for iface, _cidr in self.interfaces:
+            ip, mac = get_interface_ipmac(iface)
+            if not ip:
+                continue
+            existing = merged.get(ip)
+            if existing is None:
+                merged[ip] = Device(
+                    ip=ip, mac=mac or "", vendor="(this device)",
+                    hostname=host, iface=iface,
+                )
+            else:
+                if not existing.mac and mac:
+                    existing.mac = mac
+                if not existing.hostname:
+                    existing.hostname = host
+                if not existing.vendor:
+                    existing.vendor = "(this device)"
+                seen_ifaces = existing.iface.split(",") if existing.iface else []
+                if iface not in seen_ifaces:
+                    seen_ifaces.append(iface)
+                    existing.iface = ",".join(seen_ifaces)

@@ -22,7 +22,7 @@ from .scanner import NetworkScanner, deep_probe, Device
 
 # --- Screen / theme -----------------------------------------------------------
 SCREEN_W, SCREEN_H = 1280, 720
-AUTO_REFRESH_SECONDS = 60
+AUTO_REFRESH_SECONDS = 300  # 5 minutes
 
 BG = "#0f1720"          # near-black blue
 CARD = "#1b2735"        # row / panel
