@@ -150,6 +150,59 @@ def discover_arpscan(iface: str) -> Optional[list[Device]]:
 
 
 # ----------------------------------------------------------------------------
+# Discovery: nmap host discovery
+# ----------------------------------------------------------------------------
+# One `Nmap scan report` block per host, MAC on its own line when nmap gets
+# ARP replies (root or cap_net_raw). Vendor is in parens after the MAC.
+_NMAP_HOST = re.compile(r"Nmap scan report for (?:\S+ \()?(\d+\.\d+\.\d+\.\d+)")
+_NMAP_MAC = re.compile(
+    r"MAC Address:\s+([0-9A-Fa-f:]{17})(?:\s+\(([^)]*)\))?"
+)
+
+
+def discover_nmap(iface: str, cidr: str) -> Optional[list[Device]]:
+    """Run `nmap -sn` against the interface's subnet. Returns None if nmap
+    isn't installed or the invocation blew up; returns [] if it ran but
+    found nothing."""
+    try:
+        # -sn: ping scan, no port scan. -PR forces ARP for local hosts.
+        # -n: no DNS (we do our own reverse-DNS pass later).
+        # --send-eth: raw Ethernet frames (needs cap_net_raw).
+        # -e <iface>: pin to the interface we're scanning.
+        proc = _run(
+            ["nmap", "-sn", "-PR", "-n", "--send-eth", "-e", iface, cidr],
+            timeout=180,
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return []
+
+    text = proc.stdout
+    if not text.strip():
+        return None
+
+    devices: dict[str, Device] = {}
+    current_ip: Optional[str] = None
+    for line in text.splitlines():
+        m = _NMAP_HOST.search(line)
+        if m:
+            current_ip = m.group(1)
+            devices.setdefault(current_ip, Device(ip=current_ip))
+            continue
+        if current_ip is None:
+            continue
+        m = _NMAP_MAC.search(line)
+        if m:
+            mac = m.group(1).lower()
+            vendor = (m.group(2) or "").strip()
+            devices[current_ip].mac = mac
+            if vendor and vendor.lower() != "unknown":
+                devices[current_ip].vendor = vendor
+    return list(devices.values())
+
+
+# ----------------------------------------------------------------------------
 # Discovery: pure-python fallback (ping sweep + ARP cache)
 # ----------------------------------------------------------------------------
 def _ping_once(ip: str, timeout_s: float = 0.4) -> bool:
@@ -381,20 +434,28 @@ class NetworkScanner:
         methods: list[str] = []
         for iface, cidr in self.interfaces:
             note(f"Scanning {cidr} on {iface} ...")
-            devs = discover_arpscan(iface)
-            if devs is not None:
-                method = "arp-scan"
+            sources: list[str] = []
+
+            arp_devs = discover_arpscan(iface)
+            if arp_devs is not None:
+                self._merge(merged, arp_devs, iface)
+                sources.append("arp-scan")
+
+            nmap_devs = discover_nmap(iface, cidr)
+            if nmap_devs is not None:
+                self._merge(merged, nmap_devs, iface)
+                sources.append("nmap")
+
+            # If neither of the raw-socket scanners was usable, fall back to
+            # the pure-python ping sweep so we return _something_.
+            if not sources:
+                note(f"arp-scan/nmap unavailable on {iface} - ping-sweep fallback")
+                self._merge(merged, discover_fallback(cidr), iface)
+                sources.append("ping-sweep")
             else:
-                note(f"arp-scan unavailable on {iface} - ping-sweep fallback")
-                devs = discover_fallback(cidr)
-                method = "ping-sweep"
-
-            self._merge(merged, devs, iface)
-
-            # Supplement arp-scan with a targeted ping sweep for anything ARP
-            # missed (sleepy phones, power-saving wifi clients that don't
-            # answer broadcast ARP but do respond to a direct ICMP echo).
-            if method == "arp-scan":
+                # Even when arp-scan/nmap run, some devices (power-saving
+                # phones, tight-firewalled hosts) only respond to a direct
+                # ICMP echo. Ping every IP nobody's answered for yet.
                 note(f"Ping-sweep supplement on {iface} ...")
                 known = {ip for ip, d in merged.items() if iface in d.iface.split(",")}
                 extra_ips = [ip for ip in ping_sweep(cidr) if ip not in known]
@@ -402,9 +463,9 @@ class NetworkScanner:
                     arp = read_arp_cache()
                     extras = [Device(ip=ip, mac=arp.get(ip, "")) for ip in extra_ips]
                     self._merge(merged, extras, iface)
-                    method = "arp-scan+ping"
+                    sources.append("ping")
 
-            methods.append(f"{iface}:{method}")
+            methods.append(f"{iface}:{'+'.join(sources)}")
 
         # Add the Vivid Unit itself — arp-scan/ping never see the host.
         self._add_self(merged)

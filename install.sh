@@ -7,20 +7,28 @@ APP_DIR="/opt/netmon"
 USER_NAME="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 
-echo ">> Installing system packages (python3-tk, arp-scan) ..."
+echo ">> Installing system packages (python3-tk, arp-scan, nmap) ..."
 sudo apt-get update
-sudo apt-get install -y python3-tk arp-scan iputils-ping
+sudo apt-get install -y python3-tk arp-scan nmap iputils-ping
 
 echo ">> Copying app to ${APP_DIR} ..."
 sudo mkdir -p "$APP_DIR"
 sudo cp -r netmon run.py "$APP_DIR"/
 sudo chown -R "$USER_NAME":"$USER_NAME" "$APP_DIR"
 
-echo ">> Granting arp-scan raw-socket capability (so the GUI runs as a normal user) ..."
-# Lets arp-scan open raw sockets without sudo. The pure-python fallback works
-# without this, but arp-scan gives you MAC vendor names in one pass.
+echo ">> Granting raw-socket capability to arp-scan and nmap ..."
+# Lets both tools open raw sockets without sudo. The pure-python fallback
+# works without this, but the two scanners give better coverage.
 ARP_BIN="$(command -v arp-scan)"
-sudo setcap cap_net_raw+ep "$ARP_BIN" || echo "   (setcap failed - the ping-sweep fallback will still work)"
+sudo setcap cap_net_raw+ep "$ARP_BIN" || echo "   (arp-scan setcap failed - ping-sweep fallback will still work)"
+
+NMAP_BIN="$(command -v nmap)"
+if [ -n "$NMAP_BIN" ]; then
+  # nmap needs cap_net_raw for ARP scan, cap_net_admin for some probe types,
+  # and cap_net_bind_service to bind low ports for probes.
+  sudo setcap cap_net_raw,cap_net_admin,cap_net_bind_service+ep "$NMAP_BIN" \
+    || echo "   (nmap setcap failed - it will still work but with degraded discovery)"
+fi
 
 echo ">> Installing desktop autostart entry for user ${USER_NAME} ..."
 AUTOSTART_DIR="${USER_HOME}/.config/autostart"
