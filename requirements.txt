@@ -1,0 +1,7 @@
+# No third-party Python packages are required.
+# Standard library only (tkinter, socket, subprocess, threading).
+#
+# System packages (installed by install.sh via apt):
+#   python3-tk      - the GUI toolkit
+#   arp-scan        - fast LAN discovery with vendor names (optional but best)
+#   iputils-ping    - ping, used by the fallback sweep and deep probe

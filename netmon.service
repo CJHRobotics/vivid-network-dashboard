@@ -1,0 +1,21 @@
+# Optional systemd alternative to the desktop-autostart entry.
+# Only use this instead of the .desktop file if you run the GUI outside a
+# normal desktop login. Adjust User= and the DISPLAY/XAUTHORITY to match your
+# session, then:
+#   sudo cp netmon.service /etc/systemd/system/
+#   sudo systemctl enable --now netmon
+[Unit]
+Description=Vivid Unit Network Monitor
+After=graphical.target network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+ExecStart=/usr/bin/python3 /opt/netmon/run.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
